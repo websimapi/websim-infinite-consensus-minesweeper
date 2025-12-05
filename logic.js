@@ -83,18 +83,17 @@ export class GameLogic {
 
     // Hash function to determine if a mine exists at x,y based on seed
     hasMine(x, y) {
-        // We combine x, y, and seed to get a unique deterministic value
-        // Simple hash: (x * 73856093) ^ (y * 19349663) ^ (seed * 83492791)
-        // Then normalize.
-
-        // Better: Use the LCG initialized with a distinctive hash of the coord
-        // To avoid patterns, we hash the coords first
+        // Optimization: Inlined LCG and hashing to avoid object allocation (new LCG) per tile
         const h1 = (x * 374761393) ^ (y * 668265263); 
         const h2 = (h1 ^ this.state.seed); 
-        const localSeed = h2 & 0x7FFFFFFF; // ensure positive
+        let state = h2 & 0x7FFFFFFF; // ensure positive
 
-        const rng = new LCG(localSeed);
-        return rng.nextFloat() < this.MINE_PROBABILITY;
+        // Inlined nextFloat() from LCG to avoid object creation overhead
+        // m = 0x80000000, a = 1103515245, c = 12345
+        state = (1103515245 * state + 12345) % 0x80000000;
+        const floatVal = state / 2147483647; // (m - 1)
+
+        return floatVal < this.MINE_PROBABILITY;
     }
 
     countNeighbors(x, y) {
@@ -136,12 +135,14 @@ export class GameLogic {
         }
 
         // Flood fill if 0
+        // Optimization: Use index pointer instead of shift() to avoid O(N^2) array re-indexing
         const queue = [[x, y]];
+        let qIndex = 0;
         const visited = new Set();
         visited.add(`${x},${y}`);
 
-        while (queue.length > 0) {
-            const [cx, cy] = queue.shift();
+        while (qIndex < queue.length) {
+            const [cx, cy] = queue[qIndex++];
             
             const neighbors = this.countNeighbors(cx, cy);
             
