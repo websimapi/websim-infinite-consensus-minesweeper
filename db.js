@@ -2,7 +2,7 @@
 export class DBManager {
     constructor(gameLogic, onStateChange, onStatus) {
         this.room = new WebsimSocket();
-        this.collectionName = 'minesweeper_consensus_v4';
+        this.collectionName = 'minesweeper_consensus_v5';
         this.gameLogic = gameLogic;
         this.onStateChange = onStateChange;
         this.onStatus = onStatus;
@@ -136,6 +136,11 @@ export class DBManager {
                 version: nextVersion,
                 last_move: new Date().toISOString()
             });
+
+            // Unlock
+            await this.room.updateRoomState({ lockedBy: null, version: nextVersion, lastUpdatedBy: this.room.clientId, lastUpdatedUsername: this.currentUser.username });
+            this.onStatus('Online');
+            return true;
         } catch (e) {
             // Error occurred, unlock and rethrow
             await this.room.updateRoomState({ lockedBy: null });

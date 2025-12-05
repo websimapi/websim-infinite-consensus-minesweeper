@@ -20,11 +20,12 @@ const App = () => {
     const logicRef = useRef(new GameLogic());
     const dbRef = useRef(null);
 
-    // Viewport State
-    const [camera, setCamera] = useState({ x: 0, y: 0 });
+    // Viewport State - Moved to Refs for performance
+    const camera = useRef({ x: 0, y: 0 });
     const isDragging = useRef(false);
     const lastMouse = useRef({ x: 0, y: 0 });
     const longPressTimer = useRef(null);
+    const frameId = useRef(null);
 
     // Initialize
     useEffect(() => {
@@ -62,7 +63,13 @@ const App = () => {
 
     const updateGameInfo = () => {
         const state = logicRef.current.state;
-        const flags = Object.keys(state.flagged).length;
+        // Count flags across chunks
+        let flags = 0;
+        if (state.chunks) {
+            for (const key in state.chunks) {
+                flags += Object.keys(state.chunks[key].flagged).length;
+            }
+        }
         setGameInfo({ flags });
     };
 
@@ -87,66 +94,106 @@ const App = () => {
         if (!canvas) return;
 
         const ctx = canvas.getContext('2d');
-        const width = canvas.width = window.innerWidth;
-        const height = canvas.height = window.innerHeight;
+        // Ensure accurate canvas size (might need debounce in real world, but fine here)
+        if (canvas.width !== window.innerWidth) canvas.width = window.innerWidth;
+        if (canvas.height !== window.innerHeight) canvas.height = window.innerHeight;
+        
+        const width = canvas.width;
+        const height = canvas.height;
+        const cam = camera.current;
 
         // Background
         ctx.fillStyle = '#2c3e50';
         ctx.fillRect(0, 0, width, height);
 
-        // Determine visible tiles
-        // Camera (0,0) is center of screen
-        const startCol = Math.floor((-width/2 - camera.x) / TILE_SIZE);
-        const endCol = Math.ceil((width/2 - camera.x) / TILE_SIZE);
-        const startRow = Math.floor((-height/2 - camera.y) / TILE_SIZE);
-        const endRow = Math.ceil((height/2 - camera.y) / TILE_SIZE);
+        // Determine visible chunks
+        const startX = -width/2 - cam.x;
+        const endX = width/2 - cam.x;
+        const startY = -height/2 - cam.y;
+        const endY = height/2 - cam.y;
+
+        const startChunkCol = Math.floor(startX / (TILE_SIZE * logicRef.current.CHUNK_SIZE));
+        const endChunkCol = Math.floor(endX / (TILE_SIZE * logicRef.current.CHUNK_SIZE));
+        const startChunkRow = Math.floor(startY / (TILE_SIZE * logicRef.current.CHUNK_SIZE));
+        const endChunkRow = Math.floor(endY / (TILE_SIZE * logicRef.current.CHUNK_SIZE));
 
         const state = logicRef.current.state;
         const exploded = !!state.exploded;
+        const chunkSizePx = TILE_SIZE * logicRef.current.CHUNK_SIZE;
 
-        for (let x = startCol; x <= endCol; x++) {
-            for (let y = startRow; y <= endRow; y++) {
-                const drawX = width/2 + camera.x + x * TILE_SIZE;
-                const drawY = height/2 + camera.y + y * TILE_SIZE;
-                const key = `${x},${y}`;
+        // Iterate ONLY visible chunks
+        for (let cx = startChunkCol; cx <= endChunkCol; cx++) {
+            for (let cy = startChunkRow; cy <= endChunkRow; cy++) {
+                const chunkKey = `${cx},${cy}`;
+                const chunk = state.chunks[chunkKey];
+                
+                // Even if chunk doesn't exist in state, we might need to draw unrevealed tiles?
+                // Minesweeper usually draws "hidden" tiles everywhere.
+                // To optimize, we assume infinite hidden tiles, but only look up data if chunk exists.
+                
+                const chunkOffsetX = cx * logicRef.current.CHUNK_SIZE;
+                const chunkOffsetY = cy * logicRef.current.CHUNK_SIZE;
 
-                const isRevealed = state.revealed[key] !== undefined;
-                const isFlagged = state.flagged[key];
+                // Iterate tiles within the chunk
+                for (let lx = 0; lx < logicRef.current.CHUNK_SIZE; lx++) {
+                    for (let ly = 0; ly < logicRef.current.CHUNK_SIZE; ly++) {
+                        const gridX = chunkOffsetX + lx;
+                        const gridY = chunkOffsetY + ly;
+                        
+                        // Culling: Check if tile is actually on screen (chunks at edges are partially visible)
+                        const drawX = width/2 + cam.x + gridX * TILE_SIZE;
+                        const drawY = height/2 + cam.y + gridY * TILE_SIZE;
+                        
+                        if (drawX < -TILE_SIZE || drawX > width || drawY < -TILE_SIZE || drawY > height) continue;
 
-                // Draw Base Tile
-                if (isRevealed) {
-                    ctx.drawImage(getImage('tile_revealed'), drawX, drawY, TILE_SIZE, TILE_SIZE);
+                        const key = `${gridX},${gridY}`;
+                        
+                        let isRevealed = false;
+                        let isFlagged = false;
+                        let count = 0;
 
-                    const count = state.revealed[key];
-                    if (count > 0) {
-                        ctx.font = 'bold 20px monospace';
-                        ctx.textAlign = 'center';
-                        ctx.textBaseline = 'middle';
-                        // Minesweeper colors
-                        const colors = ['blue', 'green', 'red', 'darkblue', 'brown', 'cyan', 'black', 'gray'];
-                        ctx.fillStyle = colors[count-1] || 'black';
-                        ctx.fillText(count, drawX + TILE_SIZE/2, drawY + TILE_SIZE/2 + 2);
+                        if (chunk) {
+                            if (chunk.revealed[key] !== undefined) {
+                                isRevealed = true;
+                                count = chunk.revealed[key];
+                            }
+                            isFlagged = !!chunk.flagged[key];
+                        }
+
+                        // Draw Base Tile
+                        if (isRevealed) {
+                            ctx.drawImage(getImage('tile_revealed'), drawX, drawY, TILE_SIZE, TILE_SIZE);
+
+                            if (count > 0) {
+                                ctx.font = 'bold 20px monospace';
+                                ctx.textAlign = 'center';
+                                ctx.textBaseline = 'middle';
+                                const colors = ['blue', 'green', 'red', 'darkblue', 'brown', 'cyan', 'black', 'gray'];
+                                ctx.fillStyle = colors[count-1] || 'black';
+                                ctx.fillText(count, drawX + TILE_SIZE/2, drawY + TILE_SIZE/2 + 2);
+                            }
+                        } else {
+                            ctx.drawImage(getImage('tile_hidden'), drawX, drawY, TILE_SIZE, TILE_SIZE);
+                        }
+
+                        // Draw Overlays
+                        if (isFlagged) {
+                            ctx.drawImage(getImage('tile_flag'), drawX, drawY, TILE_SIZE, TILE_SIZE);
+                        }
+
+                        // Show mine if exploded
+                        if (exploded && logicRef.current.hasMine(gridX, gridY)) {
+                            if (!isFlagged) { // If flagged correctly, keep flag? usually minesweeper shows mines
+                                ctx.drawImage(getImage('tile_mine'), drawX, drawY, TILE_SIZE, TILE_SIZE);
+                            }
+                        }
+
+                        // Highlight exploded mine
+                        if (state.exploded && state.exploded.x === gridX && state.exploded.y === gridY) {
+                            ctx.drawImage(getImage('tile_exploded'), drawX, drawY, TILE_SIZE, TILE_SIZE);
+                            ctx.drawImage(getImage('tile_mine'), drawX, drawY, TILE_SIZE, TILE_SIZE);
+                        }
                     }
-                } else {
-                    ctx.drawImage(getImage('tile_hidden'), drawX, drawY, TILE_SIZE, TILE_SIZE);
-                }
-
-                // Draw Overlays
-                if (isFlagged) {
-                    ctx.drawImage(getImage('tile_flag'), drawX, drawY, TILE_SIZE, TILE_SIZE);
-                }
-
-                // Show mine if exploded
-                if (exploded && logicRef.current.hasMine(x, y)) {
-                    if (!isFlagged) { // If flagged correctly, keep flag? usually minesweeper shows mines
-                        ctx.drawImage(getImage('tile_mine'), drawX, drawY, TILE_SIZE, TILE_SIZE);
-                    }
-                }
-
-                // Highlight exploded mine
-                if (state.exploded && state.exploded.x === x && state.exploded.y === y) {
-                    ctx.drawImage(getImage('tile_exploded'), drawX, drawY, TILE_SIZE, TILE_SIZE);
-                    ctx.drawImage(getImage('tile_mine'), drawX, drawY, TILE_SIZE, TILE_SIZE);
                 }
             }
         }
@@ -156,8 +203,8 @@ const App = () => {
     const screenToWorld = (sx, sy) => {
         const width = window.innerWidth;
         const height = window.innerHeight;
-        const wx = Math.floor((sx - width/2 - camera.x) / TILE_SIZE);
-        const wy = Math.floor((sy - height/2 - camera.y) / TILE_SIZE);
+        const wx = Math.floor((sx - width/2 - camera.current.x) / TILE_SIZE);
+        const wy = Math.floor((sy - height/2 - camera.current.y) / TILE_SIZE);
         return { x: wx, y: wy };
     };
 
@@ -203,7 +250,7 @@ const App = () => {
         }
 
         if (isDragging.current) {
-            setCamera(prev => ({ x: prev.x + dx, y: prev.y + dy }));
+            camera.current = { x: camera.current.x + dx, y: camera.current.y + dy };
             draw(); // Immediate redraw
         }
 

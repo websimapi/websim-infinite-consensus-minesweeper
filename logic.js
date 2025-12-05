@@ -25,8 +25,7 @@ export class GameLogic {
         this.MINE_PROBABILITY = 0.15;
         this.state = {
             seed: Math.floor(Math.random() * 1000000),
-            revealed: {}, // "x,y": value (0-8)
-            flagged: {},  // "x,y": true
+            chunks: {}, // "cx,cy": { revealed: {}, flagged: {} }
             exploded: null, // {x, y, by}
             startTime: Date.now()
         };
@@ -35,8 +34,7 @@ export class GameLogic {
     reset(newSeed) {
         this.state = {
             seed: newSeed || Math.floor(Math.random() * 1000000),
-            revealed: {},
-            flagged: {},
+            chunks: {},
             exploded: null,
             startTime: Date.now()
         };
@@ -44,11 +42,43 @@ export class GameLogic {
 
     loadState(jsonState) {
         if (!jsonState) return;
-        this.state = { ...jsonState };
+        // Migration from old flat state if needed (v4 -> v5)
+        if (jsonState.revealed && !jsonState.chunks) {
+            this.reset(jsonState.seed);
+            // We would migrate here, but since we bumped DB version, we start fresh.
+        } else {
+            this.state = { ...jsonState };
+        }
     }
 
     getState() {
         return JSON.parse(JSON.stringify(this.state));
+    }
+
+    getChunkKey(x, y) {
+        const cx = Math.floor(x / this.CHUNK_SIZE);
+        const cy = Math.floor(y / this.CHUNK_SIZE);
+        return `${cx},${cy}`;
+    }
+
+    getChunk(x, y, create = false) {
+        const key = this.getChunkKey(x, y);
+        if (!this.state.chunks[key] && create) {
+            this.state.chunks[key] = { revealed: {}, flagged: {} };
+        }
+        return this.state.chunks[key];
+    }
+
+    isRevealed(x, y) {
+        const chunk = this.getChunk(x, y);
+        const key = `${x},${y}`;
+        return chunk && chunk.revealed[key] !== undefined;
+    }
+
+    isFlagged(x, y) {
+        const chunk = this.getChunk(x, y);
+        const key = `${x},${y}`;
+        return chunk && chunk.flagged[key];
     }
 
     // Hash function to determine if a mine exists at x,y based on seed
@@ -82,22 +112,23 @@ export class GameLogic {
 
     // Actions
     flag(x, y) {
+        const chunk = this.getChunk(x, y, true);
         const key = `${x},${y}`;
-        if (this.state.revealed[key] !== undefined) return false; // Can't flag revealed
+        
+        if (chunk.revealed[key] !== undefined) return false; // Can't flag revealed
 
-        if (this.state.flagged[key]) {
-            delete this.state.flagged[key];
+        if (chunk.flagged[key]) {
+            delete chunk.flagged[key];
             return 'unflagged';
         } else {
-            this.state.flagged[key] = true;
+            chunk.flagged[key] = true;
             return 'flagged';
         }
     }
 
     reveal(x, y, username) {
-        const key = `${x},${y}`;
-        if (this.state.flagged[key]) return { result: 'ignored' };
-        if (this.state.revealed[key] !== undefined) return { result: 'ignored' };
+        if (this.isFlagged(x, y)) return { result: 'ignored' };
+        if (this.isRevealed(x, y)) return { result: 'ignored' };
 
         if (this.hasMine(x, y)) {
             this.state.exploded = { x, y, by: username, time: Date.now() };
@@ -107,14 +138,16 @@ export class GameLogic {
         // Flood fill if 0
         const queue = [[x, y]];
         const visited = new Set();
-        visited.add(key);
+        visited.add(`${x},${y}`);
 
         while (queue.length > 0) {
             const [cx, cy] = queue.shift();
-            const cKey = `${cx},${cy}`;
-
+            
             const neighbors = this.countNeighbors(cx, cy);
-            this.state.revealed[cKey] = neighbors;
+            
+            // Set revealed in correct chunk
+            const chunk = this.getChunk(cx, cy, true);
+            chunk.revealed[`${cx},${cy}`] = neighbors;
 
             // If it's a blank tile (0 mines around), auto-reveal neighbors
             if (neighbors === 0) {
@@ -125,7 +158,8 @@ export class GameLogic {
                         const ny = cy + dy;
                         const nKey = `${nx},${ny}`;
 
-                        if (!visited.has(nKey) && this.state.revealed[nKey] === undefined && !this.state.flagged[nKey]) {
+                        // Check visited and state using helpers
+                        if (!visited.has(nKey) && !this.isRevealed(nx, ny) && !this.isFlagged(nx, ny)) {
                             visited.add(nKey);
                             queue.push([nx, ny]);
                         }
