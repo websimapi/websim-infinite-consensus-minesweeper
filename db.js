@@ -1,22 +1,27 @@
 // Handles the unique "Consensus" synchronization logic
 export class DBManager {
-    constructor() {
+    constructor(gameLogic, onStateChange, onStatus) {
         this.room = new WebsimSocket();
-        this.collectionName = 'minesweeper_states_v2';
+        this.collectionName = 'minesweeper_consensus_v4';
+        this.gameLogic = gameLogic;
+        this.onStateChange = onStateChange;
+        this.onStatus = onStatus;
+        
         this.myRecord = null;
-        this.isLocked = false;
-
-        // Callbacks
-        this.onStateChange = () => {};
-        this.onSyncStatus = () => {};
-        this.onHistoryUpdate = () => {};
+        this.locked = false;
+        this.localVersion = 0;
+        this.currentUser = null;
     }
 
     async init() {
+        this.onStatus('Connecting to room...');
         await this.room.initialize();
         this.currentUser = await window.websim.getCurrentUser();
 
-        // Find my record or create it
+        // Subscribe to Room State (Signal Channel)
+        this.room.subscribeRoomState(this.handleRoomStateUpdate.bind(this));
+
+        // Find or Create My Record
         const records = await this.room.collection(this.collectionName).filter({
             username: this.currentUser.username
         }).getList();
@@ -24,73 +29,117 @@ export class DBManager {
         if (records.length > 0) {
             this.myRecord = records[0];
         } else {
-            // Initial Empty State
+            this.onStatus('Creating user record...');
             this.myRecord = await this.room.collection(this.collectionName).create({
-                current_game: null,
-                history: []
+                state: this.gameLogic.getState(),
+                last_move: null,
+                version: 0
             });
         }
-
-        // Subscribe to RoomState for locking and versioning
-        this.room.subscribeRoomState((state) => {
-            this.handleRoomStateUpdate(state);
-        });
-
-        // Try to sync initially
-        await this.initialSync();
+        
+        // Initial Sync Check
+        await this.syncIfNeeded();
     }
 
-    async initialSync() {
-        this.onSyncStatus('Syncing...');
-
-        // Check room state for the latest version
+    async syncIfNeeded() {
         const { lastUpdatedBy, version } = this.room.roomState;
-
-        if (lastUpdatedBy && lastUpdatedBy !== this.room.clientId) {
-             // Find that user's record
-             const peer = this.room.peers[lastUpdatedBy];
-             if (peer) {
-                 const records = await this.room.collection(this.collectionName).filter({
-                     username: peer.username
-                 }).getList();
-
-                 if (records.length > 0) {
-                     const masterState = records[0].current_game;
-                     const masterHistory = records[0].history;
-                     // Update my record to match
-                     if (masterState) {
-                         await this.updateMyRecord(masterState, masterHistory);
-                         this.onStateChange(masterState);
-                         this.onHistoryUpdate(masterHistory);
-                     }
-                 }
-             }
-        } else if (!this.myRecord.current_game) {
-            // I am alone or first, or no state exists. 
-            // If I have no state, start fresh.
-            this.onStateChange(null); // Triggers logic to create new game
-        } else {
-            // I have a state, assume it's good for now
-            this.onStateChange(this.myRecord.current_game);
-            this.onHistoryUpdate(this.myRecord.history);
+        
+        if (version && version > this.localVersion) {
+            this.onStatus(`Syncing from ${lastUpdatedBy ? 'peer' : 'room'}...`);
+            
+            // If we have a lastUpdatedBy, fetch their record
+            if (lastUpdatedBy && lastUpdatedBy !== this.room.clientId) {
+                const peer = this.room.peers[lastUpdatedBy];
+                // Peer might have left, but record remains if we filter by username
+                // But room.peers only has active. We need to find the record by "owner"
+                // Actually, let's just use the fact we can query the collection.
+                // We need the user's username. We can assume lastUpdatedBy is clientId.
+                // WEBSIM TRICK: We don't easily know username from clientId if they left.
+                // So let's rely on roomState storing username too.
+                
+                const targetUsername = this.room.roomState.lastUpdatedUsername;
+                if (targetUsername) {
+                    const records = await this.room.collection(this.collectionName).filter({
+                        username: targetUsername
+                    }).getList();
+                    
+                    if (records.length > 0) {
+                        const masterState = records[0].state;
+                        this.gameLogic.loadState(masterState);
+                        
+                        // IMPORTANT: Update MY record to match the consensus
+                        // This fulfills "append and edit in the info into their row"
+                        await this.room.collection(this.collectionName).update(this.myRecord.id, {
+                            state: masterState,
+                            version: version
+                        });
+                        
+                        this.localVersion = version;
+                        this.onStateChange(this.gameLogic.getState());
+                    }
+                }
+            } else if (lastUpdatedBy === this.room.clientId) {
+                // I updated it, just sync version
+                this.localVersion = version;
+            }
         }
-
-        this.onSyncStatus('Online');
+        this.onStatus('Online');
     }
 
-    handleRoomStateUpdate(state) {
-        // If locked by someone else, update UI
-        if (state.lockedBy && state.lockedBy !== this.room.clientId) {
-            this.isLocked = true;
-            this.onSyncStatus(`Busy (${this.room.peers[state.lockedBy]?.username || 'Unknown'})...`);
+    async handleRoomStateUpdate(state) {
+        if (state.lockedBy) {
+            this.locked = true;
+            const locker = this.room.peers[state.lockedBy]?.username || 'User';
+            this.onStatus(`Locked by ${locker}...`);
         } else {
-            this.isLocked = false;
-            this.onSyncStatus('Online');
+            this.locked = false;
+            await this.syncIfNeeded();
         }
+    }
 
-        // If a version update happened and I didn't do it, sync
-        if (state.lastUpdatedBy && state.lastUpdatedBy !== this.room.clientId) {
-             // We
+    async performMove(actionCallback) {
+        if (this.locked) return false;
+
+        try {
+            this.onStatus('Acquiring lock...');
+            
+            // 1. Attempt Lock
+            await this.room.updateRoomState({ lockedBy: this.room.clientId });
+            
+            // Small delay to ensure propagation/reduce race conditions (simple polling lock)
+            // Real consensus is harder, but this is "Consensus Lite"
+            await new Promise(r => setTimeout(r, 100)); 
+            
+            // Verify lock
+            if (this.room.roomState.lockedBy !== this.room.clientId) {
+                this.onStatus('Lock failed, retry...');
+                return false;
+            }
+
+            // 2. Perform Logic
+            const result = actionCallback(this.gameLogic);
+            if (!result || result.result === 'ignored') {
+                // Nothing changed
+                await this.room.updateRoomState({ lockedBy: null });
+                this.onStatus('Online');
+                return false;
+            }
+
+            this.onStatus('Saving to DB...');
+            
+            // 3. Update My DB Row
+            const nextVersion = (this.room.roomState.version || 0) + 1;
+            const newState = this.gameLogic.getState();
+            
+            await this.room.collection(this.collectionName).update(this.myRecord.id, {
+                state: newState,
+                version: nextVersion,
+                last_move: new Date().toISOString()
+            });
+        } catch (e) {
+            // Error occurred, unlock and rethrow
+            await this.room.updateRoomState({ lockedBy: null });
+            throw e;
         }
     }
 }
